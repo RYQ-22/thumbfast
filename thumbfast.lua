@@ -26,8 +26,13 @@ local options = {
     -- Note that this is lower quality than increasing max_height and max_width
     scale_factor = 1,
 
-    -- Apply tone-mapping, no to disable
+    -- Apply tone-mapping, no to disable, gpu to tone-map HDR with mpv's gpu video filter
     tone_mapping = "auto",
+
+    -- Curve and parameter used by tone_mapping=gpu (the gpu filter uses mpv's legacy renderer,
+    -- so only clip, mobius, reinhard, hable, gamma, linear and bt.2390 behave differently)
+    gpu_tone_mapping = "mobius",
+    gpu_tone_mapping_param = "0.2",
 
     -- Overlay id
     overlay_id = 42,
@@ -46,6 +51,17 @@ local options = {
 
     -- Enable hardware decoding
     hwdec = false,
+
+    -- Decoder threads for the thumbnailer, 0 for auto
+    decode_threads = 2,
+
+    -- Decode with NVIDIA cuvid and downscale on the GPU before frames are copied back (NVIDIA GPUs only,
+    -- falls back to the regular decoder otherwise)
+    cuvid = false,
+
+    -- Peak brightness in nits of HDR thumbnails with tone_mapping=gpu,
+    -- auto for the display peak when mpv outputs HDR (SDR white, 203, otherwise)
+    hdr_peak = "auto",
 
     -- Windows only: use native Windows API to write to pipe (requires LuaJIT)
     direct_io = false,
@@ -163,6 +179,8 @@ local filters_reset = {["lavfi-crop"]=true, ["crop"]=true}
 local filters_runtime = {["hflip"]=true, ["vflip"]=true}
 local filters_all = {["hflip"]=true, ["vflip"]=true, ["lavfi-crop"]=true, ["crop"]=true}
 
+local cuvid_decoders = {h264="h264_cuvid", hevc="hevc_cuvid", av1="av1_cuvid", vp9="vp9_cuvid", vp8="vp8_cuvid",
+    mpeg2video="mpeg2_cuvid", mpeg4="mpeg4_cuvid", vc1="vc1_cuvid", mjpeg="mjpeg_cuvid"}
 local tone_mappings = {["none"]=true, ["clip"]=true, ["linear"]=true, ["gamma"]=true, ["reinhard"]=true, ["hable"]=true, ["mobius"]=true}
 local last_tone_mapping
 
@@ -347,7 +365,7 @@ local function vf_string(filters, full)
         end
     end
 
-    if (full and options.tone_mapping ~= "no") or options.tone_mapping == "auto" then
+    if options.tone_mapping ~= "gpu" and ((full and options.tone_mapping ~= "no") or options.tone_mapping == "auto") then
         if properties["video-params"] and properties["video-params"]["primaries"] == "bt.2020" then
             local tone_mapping = options.tone_mapping
             if tone_mapping == "auto" then
@@ -365,7 +383,13 @@ local function vf_string(filters, full)
     end
 
     if full then
-        vf = vf.."scale=w="..effective_w..":h="..effective_h..par..",pad=w="..effective_w..":h="..effective_h..":x=-1:y=-1,format=bgra"
+        local hdr = properties["video-params"] and properties["video-params"]["primaries"] == "bt.2020"
+        if hdr and options.tone_mapping == "gpu" then
+            -- mpv's bundled FFmpeg has no zscale, so tone-map HDR with mpv's own renderer instead
+            vf = vf.."gpu=w="..effective_w..":h="..effective_h..",format=bgra"
+        else
+            vf = vf.."scale=w="..effective_w..":h="..effective_h..par..",pad=w="..effective_w..":h="..effective_h..":x=-1:y=-1,format=bgra"
+        end
     end
 
     return vf
@@ -465,7 +489,7 @@ local function spawn(time)
         "--edition="..(properties["edition"] or "auto"), "--vid="..(vid or "auto"), "--no-sub", "--no-audio",
         "--start="..time, allow_fast_seek and "--hr-seek=no" or "--hr-seek=yes",
         "--ytdl-format=worst", "--demuxer-readahead-secs=0", "--demuxer-max-bytes=128KiB",
-        "--vd-lavc-skiploopfilter=all", "--vd-lavc-software-fallback=1", "--vd-lavc-fast", "--vd-lavc-threads=2", "--hwdec="..(options.hwdec and "auto" or "no"),
+        "--vd-lavc-skiploopfilter=all", "--vd-lavc-software-fallback=1", "--vd-lavc-fast", "--vd-lavc-threads="..options.decode_threads, "--hwdec="..(options.hwdec and "auto" or "no"),
         "--vf="..vf_string(filters_all, true),
         "--sws-scaler=fast-bilinear",
         "--video-rotate="..last_rotate,
@@ -478,6 +502,40 @@ local function spawn(time)
 
     if support_media_control then
         table.insert(args, "--media-controls=no")
+    end
+
+    if options.cuvid and vf_string(filters_reset) == "" then
+        local codec = properties["current-tracks/video"] and properties["current-tracks/video"]["codec"]
+        local par = properties["video-out-params"] and properties["video-out-params"]["par"] or 1
+        if cuvid_decoders[codec] and par == 1 and effective_w then
+            -- 2x the thumbnail size keeps the final downscale in the gpu/scale filter sharp
+            local w, h = effective_w * 2, effective_h * 2
+            if (properties["video-params"] and properties["video-params"]["rotate"] or 0) % 180 ~= 0 then
+                w, h = h, w
+            end
+            table.insert(args, "--vd="..cuvid_decoders[codec]..",")
+            table.insert(args, "--vd-lavc-o=resize="..w.."x"..h)
+        end
+    end
+
+    if options.tone_mapping == "gpu" then
+        -- vo_gpu_next composites BGRA overlays in the source video's colorspace, so encode HDR thumbnails
+        -- that way instead of as sRGB
+        local params = properties["video-params"] or {}
+        table.insert(args, "--target-trc="..(params["gamma"] or "srgb"))
+        table.insert(args, "--target-prim="..(params["primaries"] or "bt.709"))
+        local peak = 203
+        local target = properties["video-target-params"]
+        if (params["gamma"] == "pq" or params["gamma"] == "hlg") and target and (target["gamma"] == "pq" or target["gamma"] == "hlg") then
+            peak = math.floor(tonumber(options.hdr_peak) or target["max-luma"] or 203)
+            if peak > 203 then
+                -- overlays are tone-mapped from image-subs-hdr-peak (SDR white by default), which would clip them
+                mp.set_property_native("image-subs-hdr-peak", peak)
+            end
+        end
+        table.insert(args, "--target-peak="..peak)
+        table.insert(args, "--tone-mapping="..options.gpu_tone_mapping)
+        table.insert(args, "--tone-mapping-param="..options.gpu_tone_mapping_param)
     end
 
     if os_name == "darwin" and properties["macos-app-activation-policy"] then
@@ -937,6 +995,7 @@ mp.observe_property("demuxer-via-network", "native", update_property)
 mp.observe_property("stream-open-filename", "native", update_property)
 mp.observe_property("macos-app-activation-policy", "native", update_property)
 mp.observe_property("current-vo", "native", update_property)
+mp.observe_property("video-target-params", "native", update_property)
 mp.observe_property("video-rotate", "native", update_property)
 mp.observe_property("video-crop", "native", update_property)
 mp.observe_property("path", "native", update_property)

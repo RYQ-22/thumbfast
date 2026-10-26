@@ -54,13 +54,17 @@ If you installed mpv via [Homebrew](https://brew.sh/), there are no issues.
 `thumbnail`: Path for the temporary thumbnail file (must not be a directory). Leave empty for auto.  
 `max_height`, `max_width`: Maximum thumbnail generation size in pixels (scaled down to fit). Values are scaled when hidpi is enabled. Defaults to 200x200.  
 `scale_factor`: Scale factor for thumbnail display size (requires mpv 0.38+). Lower quality than increasing max_height and max_width. Defaults to 1.  
-`tone_mapping`: Apply tone-mapping, no to disable. Defaults to auto, which copies your mpv config.  
+`tone_mapping`: Apply tone-mapping, no to disable. Defaults to auto, which copies your mpv config. `gpu` tone-maps HDR with mpv's gpu video filter (for mpv builds whose FFmpeg lacks zscale) and keeps thumbnails in the video's colorspace, which is how `vo=gpu-next` displays overlays.  
+`gpu_tone_mapping`, `gpu_tone_mapping_param`: Curve and parameter for `tone_mapping=gpu`. Defaults to mobius, 0.2.  
+`hdr_peak`: Peak brightness in nits of HDR thumbnails with `tone_mapping=gpu`. Defaults to auto, the display peak when mpv outputs HDR (203 otherwise); `image-subs-hdr-peak` is raised to match.  
 `overlay_id`: Overlay id for thumbnails. Leave blank unless you know what you're doing.  
 `spawn_first`: Spawn thumbnailer on file load for faster initial thumbnails. Defaults to no.  
 `quit_after_inactivity`: Close thumbnailer process after an inactivity period in seconds. Defaults to 0 (disabled).  
 `network`: Enable on remote files. Defaults to no.  
 `audio`: Enable on audio files. Defaults to no.  
 `hwdec`: Enable hardware decoding. Defaults to no.  
+`decode_threads`: Decoder threads for the thumbnailer, 0 for auto. Defaults to 2.  
+`cuvid`: Decode with NVIDIA cuvid and downscale on the GPU before copying frames back. Falls back to the regular decoder. Defaults to no.  
 `direct_io`: Windows only: write directly to pipe (requires LuaJIT). Should improve performance, ymmv.  
 `mpv_path`: Custom path to the mpv executable. Defaults to mpv.
 
