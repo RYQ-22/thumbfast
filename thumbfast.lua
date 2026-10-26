@@ -337,6 +337,17 @@ local function vo_tone_mapping()
     end
 end
 
+local function cuvid_decoder()
+    -- cuvid resizes before any filter runs, so skip it when cropping and for anamorphic video
+    if not options.cuvid or not effective_w or (properties["video-crop"] or "") ~= "" then return nil end
+    for _, filter in ipairs(properties["vf"] or {}) do
+        if filters_reset[filter.name] then return nil end
+    end
+    if (properties["video-out-params"] and properties["video-out-params"]["par"] or 1) ~= 1 then return nil end
+    local codec = properties["current-tracks/video"] and properties["current-tracks/video"]["codec"]
+    return cuvid_decoders[codec]
+end
+
 local function vf_string(filters, full)
     local vf = ""
     local vf_table = properties["vf"]
@@ -385,8 +396,18 @@ local function vf_string(filters, full)
     if full then
         local hdr = properties["video-params"] and properties["video-params"]["primaries"] == "bt.2020"
         if hdr and options.tone_mapping == "gpu" then
-            -- mpv's bundled FFmpeg has no zscale, so tone-map HDR with mpv's own renderer instead
-            vf = vf.."gpu=w="..effective_w..":h="..effective_h..",format=bgra"
+            -- mpv's bundled FFmpeg has no zscale, so tone-map HDR with mpv's own renderer instead.
+            -- Exact seeks push every decoded frame through the filter, so downscale first unless cuvid already
+            -- did; uploading full-size frames is slow on integrated GPUs
+            if not cuvid_decoder() then
+                vf = vf.."scale=w="..(effective_w * 2)..":h="..(effective_h * 2)..","
+            end
+            -- unlike scale, the gpu filter applies the video rotation itself, so its output is already rotated
+            local gpu_w, gpu_h = effective_w, effective_h
+            if (properties["video-out-params"] and properties["video-out-params"]["rotate"] or 0) % 180 == 90 then
+                gpu_w, gpu_h = gpu_h, gpu_w
+            end
+            vf = vf.."gpu=w="..gpu_w..":h="..gpu_h..",format=bgra"
         else
             vf = vf.."scale=w="..effective_w..":h="..effective_h..par..",pad=w="..effective_w..":h="..effective_h..":x=-1:y=-1,format=bgra"
         end
@@ -504,18 +525,12 @@ local function spawn(time)
         table.insert(args, "--media-controls=no")
     end
 
-    if options.cuvid and vf_string(filters_reset) == "" then
-        local codec = properties["current-tracks/video"] and properties["current-tracks/video"]["codec"]
-        local par = properties["video-out-params"] and properties["video-out-params"]["par"] or 1
-        if cuvid_decoders[codec] and par == 1 and effective_w then
-            -- 2x the thumbnail size keeps the final downscale in the gpu/scale filter sharp
-            local w, h = effective_w * 2, effective_h * 2
-            if (properties["video-params"] and properties["video-params"]["rotate"] or 0) % 180 ~= 0 then
-                w, h = h, w
-            end
-            table.insert(args, "--vd="..cuvid_decoders[codec]..",")
-            table.insert(args, "--vd-lavc-o=resize="..w.."x"..h)
-        end
+    local decoder = cuvid_decoder()
+    if decoder then
+        -- 2x the thumbnail size keeps the final downscale in the gpu/scale filter sharp
+        -- (effective size is before video-rotate, like the decoded frames)
+        table.insert(args, "--vd="..decoder..",")
+        table.insert(args, "--vd-lavc-o=resize="..(effective_w * 2).."x"..(effective_h * 2))
     end
 
     if options.tone_mapping == "gpu" then
@@ -717,7 +732,7 @@ seek_timer = mp.add_periodic_timer(seek_period, function()
         seek(allow_fast_seek)
         seek_period_counter = 1
     else
-        if seek_period_counter == 2 then
+        if seek_period_counter == 1 then
             if allow_fast_seek then
                 seek_timer:kill()
                 seek()
